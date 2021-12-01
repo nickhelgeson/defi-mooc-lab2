@@ -137,6 +137,17 @@ contract LiquidationOperator is IUniswapV2Callee {
 
     // TODO: define constants used in the contract including ERC-20 tokens, Uniswap Pairs, Aave lending pools, etc. */
     //    *** Your code here ***
+    ILendingPool immutable lendingPool;
+    IUniswapV2Factory immutable factory;
+    address immutable me;
+    address immutable targetAddr = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
+    address USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+    address WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    IERC20 immutable USDTPool;
+    IERC20 immutable WBTCPool;
+    IERC20 immutable WETHPool;
+
     // END TODO
 
     // some helper function, it is totally fine if you can finish the lab without using these function
@@ -154,6 +165,22 @@ contract LiquidationOperator is IUniswapV2Callee {
             "UniswapV2Library: INSUFFICIENT_LIQUIDITY"
         );
         uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = reserveIn * 1000 + amountInWithFee;
+        amountOut = numerator / denominator;
+    }
+
+    function convert(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) internal pure returns (uint256 amountOut) {
+        require(amountIn > 0, "UniswapV2Library: INSUFFICIENT_INPUT_AMOUNT");
+        require(
+            reserveIn > 0 && reserveOut > 0,
+            "UniswapV2Library: INSUFFICIENT_LIQUIDITY"
+        );
+        uint256 amountInWithFee = amountIn * 1000;
         uint256 numerator = amountInWithFee * reserveOut;
         uint256 denominator = reserveIn * 1000 + amountInWithFee;
         amountOut = numerator / denominator;
@@ -180,23 +207,35 @@ contract LiquidationOperator is IUniswapV2Callee {
     constructor() {
         // TODO: (optional) initialize your contract
         //   *** Your code here ***
+        lendingPool = ILendingPool(0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9);
+        factory = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
+        me = address(this);
+        USDTPool = IERC20(USDT);
+        WBTCPool = IERC20(WBTC);
+        WETHPool = IERC20(WETH);
         // END TODO
     }
 
     // TODO: add a `receive` function so that you can withdraw your WETH
     //   *** Your code here ***
+    receive() external payable {}
+
     // END TODO
 
     // required by the testing script, entry for your liquidation call
     function operate() external {
         // TODO: implement your liquidation logic
-
         // 0. security checks and initializing variables
         //    *** Your code here ***
-
         // 1. get the target user account data & make sure it is liquidatable
         //    *** Your code here ***
-
+        (, , , , , uint256 healthFactor) = lendingPool.getUserAccountData(
+            targetAddr
+        );
+        require(
+            healthFactor < 10**health_factor_decimals,
+            "Target Not Liquidatable"
+        );
         // 2. call flash swap to liquidate the target user
         // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
         // we know that the target user borrowed USDT with WBTC as collateral
@@ -204,9 +243,21 @@ contract LiquidationOperator is IUniswapV2Callee {
         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
         //    *** Your code here ***
 
+        // Calculate max amount of collateral to purchase at round 1
+        // uint256 ToPayWETH = 325851067686930000000;
+        uint256 ToPayWETH = 925851067686930000000;
+        address pairAddr = factory.getPair(WETH, USDT);
+        IUniswapV2Pair pair = IUniswapV2Pair(pairAddr);
+        (uint256 reserveWETH, uint256 reserveUSDT, ) = pair.getReserves();
+        uint256 toPayUSDT = convert(ToPayWETH, reserveWETH, reserveUSDT);
+        // Flash load round 1
+        pair.swap(0, toPayUSDT, me, abi.encode("flash loan"));
         // 3. Convert the profit into ETH and send back to sender
         //    *** Your code here ***
-
+        uint256 MyWETHAmount = WETHPool.balanceOf(me);
+        IWETH(WETH).withdraw(MyWETHAmount);
+        (bool success, ) = msg.sender.call{value: MyWETHAmount}("");
+        assert(success);
         // END TODO
     }
 
@@ -218,19 +269,31 @@ contract LiquidationOperator is IUniswapV2Callee {
         bytes calldata
     ) external override {
         // TODO: implement your liquidation logic
-
         // 2.0. security checks and initializing variables
         //    *** Your code here ***
-
         // 2.1 liquidate the target user
         //    *** Your code here ***
-
+        USDTPool.approve(address(lendingPool), amount1);
+        lendingPool.liquidationCall(WBTC, USDT, targetAddr, amount1, false);
         // 2.2 swap WBTC for other things or repay directly
         //    *** Your code here ***
+        uint256 balanceWBTC = WBTCPool.balanceOf(me);
+        address pairAddr = factory.getPair(WBTC, WETH);
+        IUniswapV2Pair pair = IUniswapV2Pair(pairAddr);
+        (uint256 reserveWBTC, uint256 reserveWETH, ) = pair.getReserves();
+        uint256 totalETH = getAmountOut(balanceWBTC, reserveWBTC, reserveWETH);
+        WBTCPool.approve(address(pair), balanceWBTC);
+        WBTCPool.transfer(address(pair), balanceWBTC);
+        pair.swap(0, totalETH, me, "");
 
         // 2.3 repay
         //    *** Your code here ***
-        
+        pairAddr = factory.getPair(WETH, USDT);
+        pair = IUniswapV2Pair(pairAddr);
+        (uint256 reserveWETH2, uint256 reserveUSDT2, ) = pair.getReserves();
+        uint256 RepayWETH = getAmountIn(amount1, reserveWETH2, reserveUSDT2);
+        WETHPool.approve(msg.sender, RepayWETH);
+        WETHPool.transfer(msg.sender, RepayWETH);
         // END TODO
     }
 }
